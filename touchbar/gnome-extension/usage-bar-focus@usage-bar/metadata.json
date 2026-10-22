@@ -1,0 +1,7 @@
+{
+  "uuid": "usage-bar-focus@usage-bar",
+  "name": "usage-bar focus publisher",
+  "description": "Writes the focused window's class and title to $XDG_RUNTIME_DIR/usage-bar/focus.json so the usage-bar Touch Bar renderer knows when a terminal is focused. Nothing else; no network.",
+  "shell-version": ["48", "49", "50"],
+  "version": 1
+}

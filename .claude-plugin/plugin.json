@@ -1,0 +1,6 @@
+{
+  "name": "usage-bar",
+  "version": "0.1.0",
+  "description": "Shows your rate-limit windows, context fill and session cost in a slim band above the prompt.",
+  "types": "./types/index.d.ts"
+}

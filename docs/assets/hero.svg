@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="260" viewBox="0 0 1200 260" role="img" aria-label="usage-bar: your Claude Code usage above the prompt. A terminal mock-up showing a band with the 5-hour window at 37%, the 7-day window at 12%, context at 41% and a session cost of $1.23, sitting above the prompt box.">
+  <rect width="1200" height="260" rx="14" fill="#14161a"/>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="22">
+    <text x="40" y="58" fill="#6b7280">usage-bar</text>
+    <text x="40" y="112" fill="#6b7280">5h </text>
+    <text x="82" y="112" fill="#4ade80">████░░░░░░</text>
+    <text x="302" y="112" fill="#d1d5db"> 37%</text>
+    <text x="368" y="112" fill="#6b7280">↻2h14m</text>
+    <text x="510" y="112" fill="#4b5563">│</text>
+    <text x="548" y="112" fill="#6b7280">7d </text>
+    <text x="590" y="112" fill="#4ade80">█░░░░░░░░░</text>
+    <text x="810" y="112" fill="#d1d5db"> 12%</text>
+    <text x="876" y="112" fill="#6b7280">↻4d3h</text>
+    <text x="1000" y="112" fill="#4b5563">│</text>
+    <text x="1030" y="112" fill="#6b7280">ctx </text>
+    <text x="1096" y="112" fill="#4ade80">41%</text>
+  </g>
+  <rect x="40" y="148" width="1120" height="72" rx="8" fill="none" stroke="#3b3f46" stroke-width="2"/>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="22">
+    <text x="64" y="192" fill="#9ca3af">&gt; </text>
+    <text x="1040" y="192" fill="#6b7280">$1.23</text>
+  </g>
+</svg>

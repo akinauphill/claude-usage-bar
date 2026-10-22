@@ -1,0 +1,1147 @@
+#!/usr/bin/env python3
+"""usage-bar Touch Bar renderer for t1bridge.
+
+One renderer that keeps everything t1bridge's built-in bar does on a machine
+with no desktop provider (Esc, Fn for F1-F12, display and keyboard-backlight
+steps with hold-to-repeat, the Touch ID overlay and its cancel), and draws
+your Claude Code usage in the free right-hand half while a terminal is focused.
+
+Protocol: t1bridge docs/interfaces.md (T1HW over /run/t1bridge/touchbar.sock).
+A bug in this file exits the process so t1bridge falls back to its built-in
+renderer; a lost or revoked connection is retried with backoff, like the
+built-in one.
+"""
+
+import argparse
+import fcntl
+import json
+import re
+import math
+import mmap
+import os
+import select
+import socket
+import shutil
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+import cairo
+
+SOCKET_PATH = "/run/t1bridge/touchbar.sock"
+TOUCH_ID_STATE = "/run/t1bridge/touch-id-state.json"
+
+MAGIC = b"T1HW"
+MAJOR = 1
+HEADER = struct.Struct("<4sHHII")  # magic, major, type, payload length, request id
+
+HELLO, REGISTER_BUFFER, SUBMIT_FRAME, TAP_KEYS = 0x0001, 0x0002, 0x0003, 0x0004
+SET_DISPLAY, SET_KEYBOARD = 0x0005, 0x0006
+CANCEL_TOUCH_ID, STEP_DISPLAY, STEP_KEYBOARD = 0x0007, 0x0008, 0x0009
+HELLO_ACK, ACK, ERROR, FRAME_RELEASED, INPUT_FRAME = 0x8001, 0x8002, 0x8003, 0x9001, 0x9002
+
+BASE_FEATURES = 0x27  # sealed memfd frames, input frames, key taps, Touch ID cancel
+FEATURE_DISPLAY, FEATURE_KEYBOARD = 0x08, 0x10
+WANT_MINOR = 1
+
+BUFFER_ID = 1
+SLOT_COUNT = 13
+STALE_AFTER = 600.0  # seconds without a measurement before the readout dims
+POLL_INTERVAL = 0.25
+
+KEY_ESC = 1
+FUNCTION_CODES = [59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 87, 88]
+
+DEFAULT_TERMINALS = [
+    "ghostty", "kitty", "alacritty", "wezterm", "gnome-terminal", "ptyxis",
+    "kgx", "org.gnome.console", "foot", "konsole", "xterm", "tilix", "terminator",
+]
+
+GREEN, YELLOW, RED = (0.29, 0.87, 0.50), (0.98, 0.80, 0.08), (0.97, 0.44, 0.44)
+PLATE, PLATE_PRESSED, LABEL, DIM = (0.208,) * 3, (0.298,) * 3, (0.95,) * 3, (0.55,) * 3
+
+NATIVE_WIDTH = 2170
+# Native-pixel x of the stock controls (and their width), from t1bridge's stock bar.
+# The full row is macOS's expanded Control Strip: screen, keyboard light, media, volume.
+NORMAL_CONTROLS = [
+    ("display_down", 194, 182), ("display_up", 384, 182),
+    ("keyboard_down", 602, 182), ("keyboard_up", 792, 182),
+    ("media_previous", 1010, 182), ("play_pause", 1200, 182), ("media_next", 1390, 182),
+    ("mute", 1608, 182), ("volume_down", 1798, 182), ("volume_up", 1988, 182),
+]
+# While a terminal is focused the usage readout takes the middle and the controls
+# shrink into a strip on the right, like an app's area beside the collapsed Control Strip.
+COMPACT_CONTROLS = ["display_down", "display_up", "keyboard_down", "keyboard_up",
+                    "play_pause", "mute", "volume_down", "volume_up"]
+COMPACT_WIDTH, COMPACT_PITCH = 96, 104
+USAGE_LEFT = 190
+# Holding one of these opens macOS's slider for its class instead of repeating.
+SLIDER_FOR = {"display_down": "display", "display_up": "display", "keyboard_down": "keyboard",
+              "keyboard_up": "keyboard", "volume_down": "volume", "volume_up": "volume", "mute": "volume"}
+HOLD_SLIDER_DELAY = 0.35
+SLIDER_IDLE_CLOSE = 4.0  # seconds untouched before an open slider folds away
+# Native geometry of the slider: the right end of the bar, like macOS's Control Strip
+# slider, with its close button on the left and the rest of the bar still usable.
+SLIDER_LEFT, SLIDER_CLOSE_W = 1290, 84
+SLIDER_SEND_INTERVAL = 0.05
+
+
+class ConnectionLost(Exception):
+    """The hardware service went away or revoked us: reconnect."""
+
+
+class ProtocolError(Exception):
+    """Our own bug or an unexpected reply: exit so the built-in renderer takes over."""
+
+
+# ---------------------------------------------------------------- wire format
+
+def pack(mtype, payload=b"", request_id=0):
+    return HEADER.pack(MAGIC, MAJOR, mtype, len(payload), request_id) + payload
+
+
+def unpack(data):
+    if len(data) < HEADER.size:
+        raise ProtocolError("short packet")
+    magic, major, mtype, length, request_id = HEADER.unpack_from(data)
+    if magic != MAGIC or major != MAJOR or len(data) != HEADER.size + length:
+        raise ProtocolError("malformed packet")
+    return mtype, request_id, data[HEADER.size:]
+
+
+def parse_input_frame(payload):
+    """-> (fn_pressed, [(x, y)] of contacts whose tip is down)."""
+    _ts, fn_pressed, count, _res = struct.unpack_from("<QBBH", payload)
+    contacts = []
+    for i in range(count):
+        _id, tip, _in_range, _r, x, y = struct.unpack_from("<BBBBII", payload, 12 + 12 * i)
+        if tip:
+            contacts.append((x, y))
+    return bool(fn_pressed), contacts
+
+
+# ------------------------------------------------------------------- the bar
+
+def slot_bounds(slot, width):
+    left = -(-slot * width // SLOT_COUNT)
+    right = -(-(slot + 1) * width // SLOT_COUNT)
+    return left, right - left
+
+
+class Layout:
+    """Fixed geometry and hit testing, scaled from the native 2170 x 60 panel."""
+
+    def __init__(self, width, height, display=True, keyboard=True, audio=True, media=True):
+        self.width, self.height = width, height
+        self.scale = width / NATIVE_WIDTH
+        self.available = {"display": display, "keyboard": keyboard, "audio": audio, "media": media}
+
+    def is_available(self, name):
+        group = ("display" if name.startswith("display") else "keyboard" if name.startswith("keyboard")
+                 else "audio" if name in ("mute", "volume_down", "volume_up") else "media")
+        return self.available[group]
+
+    def escape(self):
+        return slot_bounds(0, self.width)
+
+    def controls(self, compact=False):
+        if compact:
+            names = [n for n in COMPACT_CONTROLS if self.is_available(n)]
+            right = NATIVE_WIDTH
+            placed = [(n, right - (len(names) - i) * COMPACT_PITCH + (COMPACT_PITCH - COMPACT_WIDTH), COMPACT_WIDTH)
+                      for i, n in enumerate(names)]
+        else:
+            placed = [c for c in NORMAL_CONTROLS if self.is_available(c[0])]
+        return [(n, round(x * self.scale), round(w * self.scale)) for n, x, w in placed]
+
+    def usage_area(self):
+        left = round(USAGE_LEFT * self.scale)
+        strip = self.controls(compact=True)
+        right = (strip[0][1] - round(20 * self.scale)) if strip else self.width
+        return left, right - left
+
+    def overlay_left(self):
+        return slot_bounds(0, self.width)[1]
+
+    def action_at(self, x, y, fn_held, overlay=False, compact=False):
+        """The action a touch at (x, y) means, or None."""
+        if not (0 <= x < self.width and 0 <= y < self.height):
+            return None
+        if overlay and x >= self.overlay_left():
+            return None
+        if fn_held:
+            slot = min(SLOT_COUNT - 1, x * SLOT_COUNT // self.width)
+            return "escape" if slot == 0 else ("fn", slot - 1)
+        left, width = self.escape()
+        if left <= x < left + width:
+            return "escape"
+        for name, cx, cw in self.controls(compact):
+            if cx <= x < cx + cw:
+                return name
+        return None
+
+
+# ------------------------------------------------------------------- drawing
+
+def level_color(percent):
+    return RED if percent >= 85 else YELLOW if percent >= 60 else GREEN
+
+
+def percent_text(p):
+    return f"{p:.0f}%" if abs(p - round(p)) < 0.05 else f"{p:.1f}%"
+
+
+def until_reset(resets_at, now_epoch):
+    if not resets_at:
+        return ""
+    try:
+        from datetime import datetime
+        target = datetime.fromisoformat(resets_at.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return ""
+    minutes = round((target - now_epoch) / 60)
+    if minutes <= 0:
+        return ""
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h{minutes % 60:02d}m"
+    return f"{hours // 24}d{hours % 24}h"
+
+
+WINDOW_LABELS = {"five_hour": "5h", "seven_day": "7d", "spend_limit": "spend"}
+
+
+def usage_blocks(usage, now_epoch):
+    """Turn a usage snapshot into [(label, value_text, percent_or_None, detail)]."""
+    blocks = []
+    for w in usage.get("windows", []):
+        label = WINDOW_LABELS.get(w["kind"], w["kind"].replace("_", " "))
+        blocks.append((label, percent_text(w["percentUsed"]), w["percentUsed"],
+                       until_reset(w.get("resetsAt"), now_epoch)))
+    if usage.get("contextPercent") is not None:
+        p = usage["contextPercent"]
+        blocks.append(("ctx", percent_text(p), p, ""))
+    if usage.get("costUsd") is not None:
+        blocks.append(("cost", f"${usage['costUsd']:.2f}", None, ""))
+    return blocks
+
+
+def rounded_rect(ctx, x, y, w, h, r):
+    ctx.new_sub_path()
+    ctx.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    ctx.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    ctx.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    ctx.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    ctx.close_path()
+
+
+def draw_plate(ctx, x, w, height, pressed):
+    inset = 3
+    rounded_rect(ctx, x + inset, 0, w - 2 * inset, height, 8)
+    ctx.set_source_rgb(*(PLATE_PRESSED if pressed else PLATE))
+    ctx.fill()
+
+
+def centered_text(ctx, text, x, w, height, size, color, bold=False):
+    ctx.select_font_face("JetBrains Mono", cairo.FONT_SLANT_NORMAL,
+                         cairo.FONT_WEIGHT_BOLD if bold else cairo.FONT_WEIGHT_NORMAL)
+    ctx.set_font_size(size)
+    ext = ctx.text_extents(text)
+    ctx.set_source_rgb(*color)
+    ctx.move_to(x + (w - ext.x_advance) / 2, (height + ext.height) / 2 - ext.y_bearing - ext.height)
+    ctx.show_text(text)
+
+
+def draw_sun(ctx, cx, cy, big):
+    r = 7 if big else 4
+    ctx.set_source_rgb(*LABEL)
+    ctx.arc(cx, cy, r, 0, 2 * math.pi)
+    ctx.fill()
+    ctx.set_line_width(2)
+    for i in range(8):
+        a = i * math.pi / 4
+        ctx.move_to(cx + math.cos(a) * (r + 4), cy + math.sin(a) * (r + 4))
+        ctx.line_to(cx + math.cos(a) * (r + (9 if big else 6)), cy + math.sin(a) * (r + (9 if big else 6)))
+    ctx.stroke()
+
+
+def draw_keyboard(ctx, cx, cy, big):
+    ctx.set_source_rgb(*LABEL)
+    w, h = 36, 18
+    rounded_rect(ctx, cx - w / 2, cy - h / 2 + 4, w, h, 3)
+    ctx.set_line_width(2)
+    ctx.stroke()
+    for row in range(2):
+        for col in range(4):
+            ctx.rectangle(cx - 13 + col * 8, cy - 3 + row * 7 + 4, 4, 3)
+    ctx.fill()
+    if big:
+        ctx.set_line_width(2)
+        for dx in (-12, 0, 12):
+            ctx.move_to(cx + dx, cy - 13)
+            ctx.line_to(cx + dx * 1.2, cy - 19)
+        ctx.stroke()
+
+
+def draw_speaker(ctx, cx, cy, waves, muted=False):
+    ctx.set_source_rgb(*LABEL)
+    ctx.move_to(cx - 14, cy - 5)
+    ctx.line_to(cx - 8, cy - 5)
+    ctx.line_to(cx - 1, cy - 11)
+    ctx.line_to(cx - 1, cy + 11)
+    ctx.line_to(cx - 8, cy + 5)
+    ctx.line_to(cx - 14, cy + 5)
+    ctx.close_path()
+    ctx.fill()
+    ctx.set_line_width(2)
+    if muted:
+        ctx.move_to(cx + 4, cy - 6)
+        ctx.line_to(cx + 14, cy + 6)
+        ctx.move_to(cx + 14, cy - 6)
+        ctx.line_to(cx + 4, cy + 6)
+        ctx.stroke()
+        return
+    for i in range(waves):
+        r = 6 + i * 6
+        ctx.arc(cx, cy, r, -0.7, 0.7)
+        ctx.stroke()
+
+
+def draw_triangle(ctx, x, cy, size, direction):
+    ctx.move_to(x, cy - size)
+    ctx.line_to(x + direction * size * 1.4, cy)
+    ctx.line_to(x, cy + size)
+    ctx.close_path()
+    ctx.fill()
+
+
+def draw_media(ctx, cx, cy, name):
+    ctx.set_source_rgb(*LABEL)
+    if name == "play_pause":
+        draw_triangle(ctx, cx - 14, cy, 9, 1)
+        ctx.rectangle(cx + 4, cy - 9, 4, 18)
+        ctx.rectangle(cx + 11, cy - 9, 4, 18)
+        ctx.fill()
+    elif name == "media_next":
+        draw_triangle(ctx, cx - 14, cy, 8, 1)
+        draw_triangle(ctx, cx - 2, cy, 8, 1)
+        ctx.rectangle(cx + 10, cy - 8, 3, 16)
+        ctx.fill()
+    else:
+        draw_triangle(ctx, cx + 14, cy, 8, -1)
+        draw_triangle(ctx, cx + 2, cy, 8, -1)
+        ctx.rectangle(cx - 13, cy - 8, 3, 16)
+        ctx.fill()
+
+
+def draw_control(ctx, name, x, w, height, pressed, muted):
+    draw_plate(ctx, x, w, height, pressed)
+    cx, cy = x + w / 2, height / 2
+    if name.startswith("display"):
+        draw_sun(ctx, cx, cy, name.endswith("up"))
+    elif name.startswith("keyboard"):
+        draw_keyboard(ctx, cx, cy, name.endswith("up"))
+    elif name == "mute":
+        draw_speaker(ctx, cx, cy, 0, muted=muted)
+    elif name == "volume_down":
+        draw_speaker(ctx, cx, cy, 1)
+    elif name == "volume_up":
+        draw_speaker(ctx, cx, cy, 2)
+    else:
+        draw_media(ctx, cx, cy, name)
+
+
+def draw_usage(ctx, left, width, height, usage, now_epoch, stale):
+    blocks = usage_blocks(usage, now_epoch)
+    if not blocks:
+        return
+    block_w = min(330, (width - 20) / len(blocks))
+    x = left + (width - block_w * len(blocks)) / 2
+    fade = 0.45 if stale else 1.0
+    for label, value, percent, detail in blocks:
+        color = level_color(percent) if percent is not None else LABEL
+        color = tuple(c * fade for c in color)
+        ctx.select_font_face("JetBrains Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        ctx.set_font_size(19)
+        ctx.set_source_rgb(*(c * fade for c in DIM))
+        ctx.move_to(x + 12, 24)
+        ctx.show_text(label)
+        label_w = ctx.text_extents(label + " ").x_advance
+        ctx.select_font_face("JetBrains Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        ctx.set_source_rgb(*color)
+        ctx.move_to(x + 12 + label_w, 24)
+        ctx.show_text(value)
+        if detail:
+            ctx.select_font_face("JetBrains Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            ctx.set_font_size(15)
+            ctx.set_source_rgb(*(c * fade for c in DIM))
+            tail = "↻" + detail
+            ctx.move_to(x + block_w - 12 - ctx.text_extents(tail).x_advance, 24)
+            ctx.show_text(tail)
+        if percent is not None:
+            bar_x, bar_w, bar_y, bar_h = x + 12, block_w - 28, 38, 10
+            rounded_rect(ctx, bar_x, bar_y, bar_w, bar_h, 5)
+            ctx.set_source_rgb(0.16, 0.16, 0.16)
+            ctx.fill()
+            fill_w = max(bar_h, bar_w * min(100, max(0, percent)) / 100)
+            rounded_rect(ctx, bar_x, bar_y, fill_w, bar_h, 5)
+            ctx.set_source_rgb(*color)
+            ctx.fill()
+        elif label == "cost":
+            ctx.select_font_face("JetBrains Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            ctx.set_font_size(15)
+            ctx.set_source_rgb(*(c * fade for c in DIM))
+            ctx.move_to(x + 12, 46)
+            ctx.show_text("this session")
+        x += block_w
+
+
+OVERLAY_LABELS = {
+    "enrollment": "Place finger on Touch ID", "authenticate": "Touch ID to continue",
+    "approve": "Touch ID to approve", "retry": "Try again", "success": "Done",
+}
+CANCELLABLE = ("authenticate", "approve", "retry")
+
+
+def draw_overlay(ctx, layout, state):
+    left = layout.overlay_left()
+    ctx.rectangle(left, 0, layout.width - left, layout.height)
+    ctx.set_source_rgb(0, 0, 0)
+    ctx.fill()
+    text_left = left
+    if state["state"] in CANCELLABLE:
+        centered_text(ctx, "✕", left, 110, layout.height, 26, LABEL)
+        text_left = left + 110
+    color = GREEN if state["state"] == "success" else LABEL
+    centered_text(ctx, OVERLAY_LABELS[state["state"]], text_left, layout.width - text_left,
+                  layout.height, 24, color, bold=True)
+    if state["state"] == "enrollment" and state.get("progress") is not None:
+        track_w = layout.width - text_left - 80
+        rounded_rect(ctx, text_left + 40, layout.height - 12, track_w, 6, 3)
+        ctx.set_source_rgb(0.2, 0.2, 0.2)
+        ctx.fill()
+        rounded_rect(ctx, text_left + 40, layout.height - 12, max(6, track_w * state["progress"] / 100), 6, 3)
+        ctx.set_source_rgb(*GREEN)
+        ctx.fill()
+
+
+def draw(ctx, layout, view):
+    """Paint one frame. `view` is a dict: fn_held, pressed, usage, now_epoch, stale, overlay."""
+    ctx.set_source_rgb(0, 0, 0)
+    ctx.paint()
+    pressed = view.get("pressed")
+    fn_held = view.get("fn_held")
+    ex, ew = layout.escape()
+    draw_plate(ctx, ex, ew, layout.height, pressed == "escape")
+    centered_text(ctx, "esc", ex, ew, layout.height, 22, LABEL)
+    if fn_held:
+        for i in range(12):
+            x, w = slot_bounds(i + 1, layout.width)
+            draw_plate(ctx, x, w, layout.height, pressed == ("fn", i))
+            centered_text(ctx, f"F{i + 1}", x, w, layout.height, 22, LABEL)
+    else:
+        compact = bool(view.get("usage"))
+        for name, x, w in layout.controls(compact):
+            draw_control(ctx, name, x, w, layout.height, pressed == name, view.get("muted", False))
+        if compact:
+            left, width = layout.usage_area()
+            draw_usage(ctx, left, width, layout.height, view["usage"], view["now_epoch"], view.get("stale"))
+    if view.get("slider") and not fn_held:
+        draw_slider(ctx, layout, view["slider"]["kind"], view["slider"]["level"], view.get("muted", False),
+                    close_pressed=view["slider"].get("close_pressed", False))
+    if view.get("overlay"):
+        draw_overlay(ctx, layout, view["overlay"])
+
+
+# ----------------------------------------------------------- state from disk
+
+def runtime_dir():
+    return os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None  # missing, or caught mid-write: keep the last good reading
+
+
+def load_config():
+    cfg = read_json(os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                                 "usage-bar", "touchbar.json")) or {}
+    return {
+        "focus": cfg.get("focus", "extension"),  # "extension" or "always"
+        "terminals": [t.lower() for t in cfg.get("terminals", DEFAULT_TERMINALS)],
+        "titleContains": str(cfg.get("titleContains", "")).lower(),
+        "debug": bool(cfg.get("debug", False)),
+        "keydLayer": str(cfg.get("keydLayer", "fn")),  # "" turns keyd following off
+    }
+
+
+class KeydFn:
+    """Follows a keyd layer (default `fn`) through `keyd listen`.
+
+    keyd grabs the keyboard, so t1bridge never sees Fn when keyd maps it to a
+    layer. `keyd listen` prints `+fn` / `-fn` as the layer turns on and off.
+    Needs read access to keyd's socket (the `keyd` group); without it this
+    stays off and Fn comes from t1bridge as usual.
+    """
+
+    def __init__(self, layer):
+        self.layer = layer
+        self.active = False
+        self.changed = threading.Event()
+        if layer and shutil.which("keyd"):
+            threading.Thread(target=self.run, daemon=True).start()
+
+    def run(self):
+        delay = 1.0
+        while True:
+            try:
+                proc = subprocess.Popen(["keyd", "listen"], stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, text=True)
+            except OSError:
+                return
+            for line in proc.stdout:
+                line = line.strip()
+                if line in (f"+{self.layer}", f"-{self.layer}"):
+                    self.active = line.startswith("+")
+                    self.changed.set()
+            proc.wait()
+            if self.active:
+                self.active = False
+                self.changed.set()
+            time.sleep(delay)  # no permission or keyd restarted: try again, slowly
+            delay = min(delay * 2, 60.0)
+
+
+def log(*parts):
+    print("usage-touchbar:", *parts, file=sys.stderr, flush=True)
+
+
+def is_focused(cfg, focus):
+    if cfg["focus"] == "always":
+        return True
+    if not focus:
+        return False  # no extension (yet): behave like the stock bar
+    cls = str(focus.get("wmClass", "")).lower() + " " + str(focus.get("appId", "")).lower()
+    if not any(t in cls for t in cfg["terminals"]):
+        return False
+    return cfg["titleContains"] in str(focus.get("title", "")).lower()
+
+
+def read_overlay():
+    state = read_json(TOUCH_ID_STATE)
+    if not state or state.get("state") not in OVERLAY_LABELS:
+        return None
+    pid = state.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        pass
+    return {"state": state["state"], "progress": state.get("progress") if state["state"] == "enrollment" else None}
+
+
+def read_view_inputs(cfg):
+    base = os.path.join(runtime_dir(), "usage-bar")
+    usage = read_json(os.path.join(base, "usage.json"))
+    focus = read_json(os.path.join(base, "focus.json"))
+    now = time.time()
+    if not usage or usage.get("ended"):
+        shown, stale = None, False
+    else:
+        shown = usage
+        stale = now - usage.get("updatedAt", 0) / 1000.0 > STALE_AFTER
+    return {
+        "usage": shown if is_focused(cfg, focus) else None,
+        "stale": stale,
+        "overlay": read_overlay(),
+        "now_epoch": now,
+    }
+
+
+# ------------------------------------------------------- slider levels
+
+def sysfs_percent(pattern):
+    import glob
+    for d in sorted(glob.glob(pattern)):
+        try:
+            with open(os.path.join(d, "brightness")) as f:
+                value = int(f.read())
+            with open(os.path.join(d, "max_brightness")) as f:
+                top = int(f.read())
+            if top > 0:
+                return round(100 * value / top)
+        except (OSError, ValueError):
+            continue
+    return 50
+
+
+def slider_region(layout):
+    left = round(SLIDER_LEFT * layout.scale)
+    return left, layout.width - left
+
+
+def slider_close(layout):
+    left, _w = slider_region(layout)
+    return left + round(8 * layout.scale), round(SLIDER_CLOSE_W * layout.scale)
+
+
+def slider_track(layout):
+    """(left, width) of the slider's track, between its two icons."""
+    left, _w = slider_region(layout)
+    return left + round(180 * layout.scale), layout.width - round(80 * layout.scale) - (left + round(180 * layout.scale))
+
+
+def draw_slider(ctx, layout, kind, level, muted=False, close_pressed=False):
+    left, width = slider_region(layout)
+    ctx.rectangle(left, 0, width, layout.height)
+    ctx.set_source_rgb(0, 0, 0)
+    ctx.fill()
+    cx, cw = slider_close(layout)
+    draw_plate(ctx, cx, cw, layout.height, close_pressed)
+    centered_text(ctx, "\u2715", cx, cw, layout.height, 22, LABEL)
+    track_left, track_w = slider_track(layout)
+    cy = layout.height / 2
+    lo_x, hi_x = track_left - 45 * layout.scale, track_left + track_w + 42 * layout.scale
+    if kind == "display":
+        draw_sun(ctx, lo_x, cy, False)
+        draw_sun(ctx, hi_x, cy, True)
+    elif kind == "keyboard":
+        draw_keyboard(ctx, lo_x, cy - 3, False)
+        draw_keyboard(ctx, hi_x, cy - 3, True)
+    else:
+        draw_speaker(ctx, lo_x, cy, 0, muted=muted)
+        draw_speaker(ctx, hi_x, cy, 2)
+    rounded_rect(ctx, track_left, cy - 5, track_w, 10, 5)
+    ctx.set_source_rgb(0.25, 0.25, 0.25)
+    ctx.fill()
+    fill = max(10, track_w * level / 100)
+    rounded_rect(ctx, track_left, cy - 5, fill, 10, 5)
+    ctx.set_source_rgb(*LABEL)
+    ctx.fill()
+    ctx.arc(track_left + fill, cy, 14, 0, 2 * math.pi)
+    ctx.set_source_rgb(*LABEL)
+    ctx.fill()
+
+
+# ------------------------------------------------------- volume and media
+
+def run_detached(argv, timeout=3):
+    def work():
+        try:
+            subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    threading.Thread(target=work, daemon=True).start()
+
+
+class Audio:
+    """Default-sink volume and mute through PipeWire's wpctl, run off the drawing thread."""
+
+    SINK = "@DEFAULT_AUDIO_SINK@"
+    STEP = "6%"  # t1bridge's built-in volume step
+
+    def __init__(self):
+        self.available = shutil.which("wpctl") is not None
+        self.muted = False
+        self.volume = 50
+        if self.available:
+            threading.Thread(target=self.watch, daemon=True).start()
+
+    def act(self, action):
+        if action == "mute":
+            run_detached(["wpctl", "set-mute", self.SINK, "toggle"])
+            self.muted = not self.muted  # shown at once; watch() corrects it
+        else:
+            run_detached(["wpctl", "set-volume", "-l", "1.0", self.SINK,
+                          self.STEP + ("+" if action == "volume_up" else "-")])
+
+    def set_level(self, percent):
+        self.volume = percent
+        run_detached(["wpctl", "set-volume", self.SINK, f"{percent / 100:.2f}"])
+        if self.muted and percent > 0:
+            run_detached(["wpctl", "set-mute", self.SINK, "0"])
+            self.muted = False
+
+    def watch(self):
+        while True:
+            try:
+                out = subprocess.run(["wpctl", "get-volume", self.SINK], capture_output=True,
+                                     text=True, timeout=2).stdout
+                self.muted = "[MUTED]" in out
+                m = re.search(r"Volume:\s*([0-9.]+)", out)
+                if m:
+                    self.volume = min(100, round(float(m.group(1)) * 100))
+            except (OSError, subprocess.SubprocessError):
+                pass
+            time.sleep(1.0)
+
+
+MEDIA_AVAILABLE = shutil.which("gdbus") is not None
+MPRIS_METHODS = {"media_previous": "Previous", "play_pause": "PlayPause", "media_next": "Next"}
+
+
+def media_action(action):
+    """Send Previous / PlayPause / Next to an MPRIS player, preferring one that is playing."""
+
+    def gdbus(*args):
+        return subprocess.run(["gdbus", "call", "--session", *args], capture_output=True,
+                              text=True, timeout=2).stdout
+
+    def work():
+        try:
+            names = re.findall(r"'(org\.mpris\.MediaPlayer2\.[^']+)'",
+                               gdbus("--dest", "org.freedesktop.DBus", "--object-path", "/org/freedesktop/DBus",
+                                     "--method", "org.freedesktop.DBus.ListNames"))
+            if not names:
+                return
+            def playing(name):
+                return "Playing" in gdbus("--dest", name, "--object-path", "/org/mpris/MediaPlayer2",
+                                          "--method", "org.freedesktop.DBus.Properties.Get",
+                                          "org.mpris.MediaPlayer2.Player", "PlaybackStatus")
+            target = next((n for n in names if playing(n)), names[0])
+            gdbus("--dest", target, "--object-path", "/org/mpris/MediaPlayer2",
+                  "--method", f"org.mpris.MediaPlayer2.Player.{MPRIS_METHODS[action]}")
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+AUDIO = None
+
+
+# ------------------------------------------------------------- the connection
+
+class Connection:
+    def __init__(self, path):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.sock.settimeout(2.0)
+        self.next_request = 1
+        try:
+            self.sock.connect(path)
+        except OSError as e:
+            self.sock.close()
+            raise ConnectionLost(str(e)) from e
+
+    def request_id(self):
+        rid, self.next_request = self.next_request, self.next_request + 1
+        return rid
+
+    def send(self, mtype, payload=b"", fds=()):
+        rid = self.request_id()
+        data = pack(mtype, payload, rid)
+        try:
+            if fds:
+                socket.send_fds(self.sock, [data], list(fds))
+            else:
+                self.sock.send(data)
+        except OSError as e:
+            raise ConnectionLost(str(e)) from e
+        return rid
+
+    def recv(self):
+        try:
+            data = self.sock.recv(65536 + HEADER.size)
+        except socket.timeout as e:
+            raise ConnectionLost("timed out") from e
+        except OSError as e:
+            raise ConnectionLost(str(e)) from e
+        if not data:
+            raise ConnectionLost("closed")
+        return unpack(data)
+
+    def hello(self, features):
+        rid = self.send(HELLO, struct.pack("<HHQ", WANT_MINOR, 0, features))
+        mtype, got, payload = self.recv()
+        if mtype == ERROR:
+            return None
+        if mtype != HELLO_ACK or got != rid:
+            raise ProtocolError("unexpected reply to Hello")
+        minor, _r, width, height, fmt, max_buffers = struct.unpack("<HHIIII", payload)
+        if fmt != 1:
+            raise ProtocolError(f"unsupported pixel format {fmt}")
+        return {"minor": minor, "width": width, "height": height, "max_buffers": max_buffers}
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def probe_feature(path, bit):
+    """True or False from the service's own answer; a probe that got no answer is retried.
+
+    The service admits one client at a time and only for the active session, so
+    right after login (or while the last probe is being released) a probe can be
+    turned away without a verdict. Treating that as "unsupported" hid the
+    brightness buttons until the next restart.
+    """
+    for _ in range(30):
+        try:
+            probe = Connection(path)
+        except ConnectionLost:
+            time.sleep(0.2)
+            continue
+        try:
+            return probe.hello(BASE_FEATURES | bit) is not None  # None: an Error reply
+        except ConnectionLost:
+            time.sleep(0.2)  # closed before replying: no verdict
+        finally:
+            probe.close()
+    raise ConnectionLost("feature probe got no answer")
+
+
+def negotiate(path):
+    """Probe the optional brightness classes on separate connections, then connect for real."""
+    accepted = BASE_FEATURES
+    for bit in (FEATURE_DISPLAY, FEATURE_KEYBOARD):
+        if probe_feature(path, bit):
+            accepted |= bit
+    for _ in range(20):  # the previous connection may take a moment to release us
+        conn = Connection(path)
+        try:
+            info = conn.hello(accepted)
+        except ConnectionLost:
+            conn.close()
+            time.sleep(0.1)
+            continue
+        if info is None:
+            conn.close()
+            raise ProtocolError("service refused the negotiated features")
+        return conn, info, accepted
+    raise ConnectionLost("could not connect")
+
+
+class Session:
+    def __init__(self, path, cfg):
+        self.cfg = cfg
+        self.conn, self.info, self.features = negotiate(path)
+        self.width, self.height = self.info["width"], self.info["height"]
+        log(f"connected: {self.info}, features=0x{self.features:02x}")
+        steps = self.info["minor"] >= 1
+        self.audio = AUDIO or Audio()
+        self.layout = Layout(self.width, self.height,
+                             display=steps and bool(self.features & FEATURE_DISPLAY),
+                             keyboard=steps and bool(self.features & FEATURE_KEYBOARD),
+                             audio=self.audio.available, media=MEDIA_AVAILABLE)
+        stride = self.width * 4
+        size = stride * self.height
+        self.fd = os.memfd_create("usage-bar-frame", os.MFD_ALLOW_SEALING | os.MFD_CLOEXEC)
+        os.ftruncate(self.fd, size)
+        fcntl.fcntl(self.fd, fcntl.F_ADD_SEALS, fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL)
+        self.mem = mmap.mmap(self.fd, size)
+        self.surface = cairo.ImageSurface.create_for_data(self.mem, cairo.FORMAT_RGB24, self.width, self.height, stride)
+        if self.surface.get_stride() != stride:
+            raise ProtocolError("unexpected cairo stride")
+        self.ctx = cairo.Context(self.surface)
+        rid = self.conn.send(REGISTER_BUFFER, struct.pack("<IIQ", BUFFER_ID, stride, size), fds=[self.fd])
+        self.expect_ack(rid)
+        self.frame_id = 0
+        self.in_flight = False
+        self.fn_held = False
+        self.hw_fn = False
+        self.keyd = KEYD or KeydFn("")
+        self.touch = None  # (action, started_at, slider_at, fired)
+        self.slider = None  # {"kind", "level", "start_level", "start_x", "sent_at", "sent"}
+        self.view = {"usage": None, "overlay": None, "now_epoch": time.time()}
+        self.dirty = True
+        self.last_poll = 0.0
+        self.last_minute = -1
+
+    def expect_ack(self, rid):
+        while True:
+            mtype, got, payload = self.conn.recv()
+            if mtype == ACK and got == rid:
+                return
+            if mtype == ERROR:
+                raise ProtocolError(f"service error {struct.unpack('<I', payload)[0]}")
+
+    def tap_keys(self, *codes):
+        slots = list(codes) + [0] * (4 - len(codes))
+        self.conn.send(TAP_KEYS, struct.pack("<BBBB4H", len(codes), 0, 0, 0, *slots))
+
+    def fire(self, action):
+        if action == "escape":
+            self.tap_keys(KEY_ESC)
+        elif isinstance(action, tuple):
+            self.tap_keys(FUNCTION_CODES[action[1]])
+        elif action in ("display_down", "display_up"):
+            self.conn.send(STEP_DISPLAY, bytes([1 if action.endswith("up") else 0]))
+        elif action in ("keyboard_down", "keyboard_up"):
+            self.conn.send(STEP_KEYBOARD, bytes([1 if action.endswith("up") else 0]))
+        elif action in ("mute", "volume_down", "volume_up"):
+            self.audio.act(action)
+        elif action in ("media_previous", "play_pause", "media_next"):
+            media_action(action)
+
+    def on_input(self, hw_fn, contacts):
+        self.hw_fn = hw_fn
+        fn_held = hw_fn or self.keyd.active
+        if fn_held != self.fn_held:
+            self.fn_held, self.dirty = fn_held, True
+            self.touch = None
+            self.slider = None
+        now = time.monotonic()
+        if self.slider is not None and self.slider_input(contacts, now):
+            return
+        overlay = self.view.get("overlay")
+        action = None
+        if contacts:
+            self.last_x = contacts[0][0]
+            x, y = contacts[0]
+            if overlay and x >= self.layout.overlay_left():
+                if overlay["state"] in CANCELLABLE and x < self.layout.overlay_left() + 110:
+                    if self.touch is None:
+                        self.conn.send(CANCEL_TOUCH_ID)
+                        self.touch = ("overlay", now, None, True)
+                else:
+                    self.touch = ("overlay", now, None, True) if self.touch is None else self.touch
+                return
+            action = self.layout.action_at(x, y, self.fn_held, compact=bool(self.view.get("usage")))
+        if self.touch and self.touch[0] in ("overlay", "consumed"):
+            if not contacts:
+                self.touch = None
+            return
+        previous = self.touch[0] if self.touch else None
+        if action != previous:
+            if previous is not None and action is None and not self.touch[3] and self.touch_lifted(contacts):
+                self.fire(previous)  # lifted over the same control: a tap
+            if action is not None:
+                hold = now + HOLD_SLIDER_DELAY if action in SLIDER_FOR and self.slider_available(action) else None
+                self.touch = (action, now, hold, False)
+            else:
+                self.touch = None
+            self.dirty = True
+        elif not contacts:
+            self.touch = None
+
+    @staticmethod
+    def touch_lifted(contacts):
+        return not contacts
+
+    def slider_available(self, action):
+        kind = SLIDER_FOR[action]
+        if kind == "volume":
+            return self.audio.available
+        return self.layout.available[kind]
+
+    def current_level(self, kind):
+        if kind == "display":
+            return sysfs_percent("/sys/class/backlight/*")
+        if kind == "keyboard":
+            return sysfs_percent("/sys/class/leds/*kbd_backlight*")
+        return self.audio.volume
+
+    def tick_repeat(self):
+        """Holding a brightness, keyboard-light or volume button opens its slider."""
+        if self.touch and self.touch[2] is not None and time.monotonic() >= self.touch[2]:
+            kind = SLIDER_FOR[self.touch[0]]
+            level = self.current_level(kind)
+            self.slider = {"kind": kind, "level": level, "start_level": level, "mode": "drag",
+                           "start_x": getattr(self, "last_x", 0), "sent_at": 0.0, "sent": level,
+                           "last_touch": time.monotonic(), "close_pressed": False}
+            self.touch = None
+            self.dirty = True
+        if self.slider and self.slider["sent"] != self.slider["level"]:
+            self.send_level()
+        if (self.slider and self.slider["mode"] == "idle"
+                and time.monotonic() - self.slider["last_touch"] > SLIDER_IDLE_CLOSE):
+            self.close_slider()
+
+    def close_slider(self):
+        if self.slider["sent"] != self.slider["level"]:
+            self.slider["sent_at"] = 0.0
+            self.send_level()
+        self.slider = None
+        self.dirty = True
+
+    def slider_input(self, contacts, now):
+        """Handle a touch while the slider is open; False hands it to the normal row.
+
+        `drag`: the hold that opened it is still down, and moves the knob relative
+        to where the finger started. Lifting leaves the slider open (`idle`).
+        `track`: a later touch on the slider puts the knob under the finger.
+        The close button, or a touch anywhere else on the bar, folds it away;
+        so does leaving it untouched for a few seconds.
+        """
+        slider = self.slider
+        slider["last_touch"] = now
+        mode = slider["mode"]
+        if mode == "close":
+            if not contacts:
+                self.close_slider()
+            return True
+        if not contacts:
+            if mode in ("drag", "track"):
+                slider["mode"] = "idle"
+                if slider["sent"] != slider["level"]:
+                    slider["sent_at"] = 0.0
+                    self.send_level()
+            return True
+        x = contacts[0][0]
+        if mode == "idle":
+            region_left, _w = slider_region(self.layout)
+            close_left, close_w = slider_close(self.layout)
+            if close_left <= x < close_left + close_w:
+                slider["mode"], slider["close_pressed"] = "close", True
+                self.dirty = True
+                return True
+            if x < region_left:
+                self.close_slider()  # a touch elsewhere: fold away and let the row have it
+                return False
+            slider["mode"] = mode = "track"
+        track_left, track_w = slider_track(self.layout)
+        if mode == "drag":
+            level = slider["start_level"] + (x - slider["start_x"]) * 100 / max(1, track_w)
+        else:
+            level = (x - track_left) * 100 / max(1, track_w)
+        level = max(0, min(100, round(level)))
+        if level != slider["level"]:
+            slider["level"] = level
+            self.dirty = True
+        return True
+
+    def send_level(self):
+        now = time.monotonic()
+        if now - self.slider["sent_at"] < SLIDER_SEND_INTERVAL:
+            return
+        kind, level = self.slider["kind"], self.slider["level"]
+        if kind == "display":
+            self.conn.send(SET_DISPLAY, bytes([level]))
+        elif kind == "keyboard":
+            self.conn.send(SET_KEYBOARD, bytes([level]))
+        else:
+            self.audio.set_level(level)
+        self.slider["sent"], self.slider["sent_at"] = level, now
+
+    def poll_keyd(self):
+        if self.keyd.changed.is_set():
+            self.keyd.changed.clear()
+            fn_held = self.hw_fn or self.keyd.active
+            if fn_held != self.fn_held:
+                self.fn_held, self.dirty, self.touch = fn_held, True, None
+
+    def poll_inputs(self):
+        now = time.monotonic()
+        if now - self.last_poll < POLL_INTERVAL:
+            return
+        self.last_poll = now
+        fresh = read_view_inputs(self.cfg)
+        minute = int(fresh["now_epoch"] // 60)
+        fresh["muted"] = self.audio.muted
+        keys = ("usage", "stale", "overlay", "muted")
+        if any(fresh[k] != self.view.get(k) for k in keys) or (fresh["usage"] and minute != self.last_minute):
+            self.dirty = True
+        self.last_minute = minute
+        self.view.update(fresh)
+
+    def render_and_submit(self):
+        draw(self.ctx, self.layout, {**self.view, "fn_held": self.fn_held, "slider": self.slider,
+                                     "pressed": self.touch[0] if self.touch and self.touch[0] != "overlay" else None})
+        self.surface.flush()
+        self.frame_id += 1
+        self.conn.send(SUBMIT_FRAME, struct.pack("<IQI", BUFFER_ID, self.frame_id, 0))
+        self.in_flight = True
+        self.dirty = False
+
+    def run(self):
+        while True:
+            self.poll_inputs()
+            self.poll_keyd()
+            self.tick_repeat()
+            if self.dirty and not self.in_flight:
+                self.render_and_submit()
+            ready, _, _ = select.select([self.conn.sock], [], [], 0.05)
+            while ready:
+                mtype, _rid, payload = self.conn.recv()
+                if mtype == FRAME_RELEASED:
+                    self.in_flight = False
+                elif mtype == INPUT_FRAME:
+                    if self.cfg["debug"]:
+                        log("input", payload.hex(), parse_input_frame(payload))
+                    self.on_input(*parse_input_frame(payload))
+                elif mtype == ERROR:
+                    code = struct.unpack("<I", payload)[0]
+                    if code in (8, 9):  # device unavailable / I/O failure: transient
+                        pass
+                    elif code == 3:  # rate-limited: let the next frame go
+                        self.in_flight = False
+                    else:
+                        raise ProtocolError(f"service error {code}")
+                ready, _, _ = select.select([self.conn.sock], [], [], 0)
+
+
+KEYD = None
+
+
+def run_forever(path):
+    global KEYD, AUDIO
+    KEYD = KeydFn(load_config()["keydLayer"])
+    AUDIO = Audio()
+    delay = 0.05
+    while True:
+        started = time.monotonic()
+        try:
+            Session(path, load_config()).run()
+        except ConnectionLost as e:
+            print(f"usage-touchbar: connection lost ({e}); reconnecting", file=sys.stderr, flush=True)
+        if time.monotonic() - started > 5:
+            delay = 0.05
+        time.sleep(delay)
+        delay = min(delay * 2, 2.0)
+
+
+def sample_views(now):
+    usage = {"windows": [{"kind": "five_hour", "percentUsed": 37, "resetsAt": None},
+                         {"kind": "seven_day", "percentUsed": 88.5, "resetsAt": None}],
+             "contextPercent": 41, "costUsd": 1.234, "updatedAt": now * 1000}
+    return {
+        "idle": {"usage": None, "muted": True},
+        "usage": {"usage": usage, "now_epoch": now},
+        "fn": {"usage": usage, "now_epoch": now, "fn_held": True},
+        "pressed": {"usage": usage, "now_epoch": now, "pressed": "display_up"},
+        "slider": {"usage": usage, "now_epoch": now, "slider": {"kind": "volume", "level": 62}},
+        "touchid": {"usage": usage, "now_epoch": now, "overlay": {"state": "authenticate", "progress": None}},
+    }
+
+
+def write_png(out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    layout = Layout(NATIVE_WIDTH, 60)
+    for name, view in sample_views(time.time()).items():
+        surface = cairo.ImageSurface(cairo.FORMAT_RGB24, layout.width, layout.height)
+        draw(cairo.Context(surface), layout, view)
+        surface.write_to_png(os.path.join(out_dir, f"{name}.png"))
+    print(f"wrote samples to {out_dir}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--socket", default=SOCKET_PATH, help="hardware socket (default: %(default)s)")
+    parser.add_argument("--png", metavar="DIR", help="write sample frames as PNGs and exit")
+    args = parser.parse_args()
+    if args.png:
+        write_png(args.png)
+        return
+    try:
+        run_forever(args.socket)
+    except (ProtocolError, KeyboardInterrupt) as e:
+        print(f"usage-touchbar: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

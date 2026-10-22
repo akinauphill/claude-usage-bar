@@ -1,0 +1,5 @@
+{
+  "name": "usage-bar-touchbar",
+  "version": "0.1.0",
+  "description": "Publishes your Claude Code usage for the Touch Bar renderer in this repo (t1bridge, MacBook Pro with Touch Bar on Linux)."
+}
